@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Интерком Wi‑Fi</title>
+
+    <!-- PWA: манифест и тема -->
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#007bff">
+
+    <!-- Библиотека Supabase для сигнализации -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+    <style>
+        body { font-family: sans-serif; padding: 20px; background: #f0f2f5; color: #333; }
+        .controls { background: white; padding: 15px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        button {
+            padding: 12px 20px; font-size: 16px; cursor: pointer;
+            background: #007bff; color: white; border: none; border-radius: 6px; margin-bottom: 8px;
+        }
+        button:hover { background: #0056b3; }
+        button.danger { background: #dc3545; }
+        button.success { background: #28a745; }
+        select, input { padding: 8px; margin: 8px 0; width: 100%; box-sizing: border-box; }
+        #status { margin-top: 10px; font-weight: bold; }
+        #deviceList { margin-top: 20px; }
+        .device-item {
+            display: flex; justify-content: space-between; align-items: center;
+            background: white; padding: 10px; margin-bottom: 5px; border-radius: 6px;
+            border-left: 4px solid #007bff;
+        }
+        .status-connected { color: #28a745; }
+        .status-disconnected { color: #dc3545; }
+    </style>
+</head>
+<body>
+
+<div class="controls">
+    <h2>Интерком (Hands‑Free)</h2>
+    <p>Микрофон включается автоматически. Для разговора ничего нажимать не нужно.</p>
+
+    <label>Режим соединения:</label>
+    <select id="connectionMode">
+        <option value="local">Только локальная сеть (Wi‑Fi LAN)</option>
+        <option value="global">Через интернет (STUN/TURN)</option>
+    </select>
+
+    <br><br>
+    <label>Задержка паузы фоновой музыки (сек):</label>
+    <select id="musicDelay">
+        <option value="0">0 сек (мгновенно)</option>
+        <option value="1">1 сек</option>
+        <option value="2">2 сек</option>
+        <option value="3">3 сек</option>
+        <option value="4">4 сек</option>
+    </select>
+
+    <br><br>
+    <button id="micToggleBtn" class="success">Микрофон: ВКЛ</button>
+    <button id="testAudioBtn">Проверка связи (эхо 3 сек)</button>
+
+    <div id="status">Статус: Ожидание доступа к микрофону...</div>
+</div>
+
+<div id="deviceList">
+    <h3>Подключённые устройства:</h3>
+    <p id="noDevices">Нет подключённых устройств</p>
+</div>
+
+<!-- Скрытый элемент для воспроизведения входящего звука -->
+<audio id="remoteAudio" autoplay></audio>
+
+<script>
+    // ================= НАСТРОЙКИ SUPABASE (ОБЯЗАТЕЛЬНО ИЗМЕНИТЬ) =================
+    const SUPABASE_URL = 'https://ВСТАВЬ-СЮДА-URL-ПРОЕКТА.supabase.co';   // ← ЗАМЕНИ НА СВОЁ
+    const SUPABASE_KEY = 'ВСТАВЬ-СЮДА-ANON-KEY';                          // ← ЗАМЕНИ НА СВОЁ
+    const ROOM = 'intercom-main';  // Имя комнаты — одинаковое на всех устройствах
+    // ============================================================================
+
+    // --- Конфигурация и переменные ---
+    const pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+    let pc = new RTCPeerConnection(pcConfig);
+    let localStream;
+    let micEnabled = true;
+    
+    const statusDiv = document.getElementById('status');
+    const micToggleBtn = document.getElementById('micToggleBtn');
+    const testAudioBtn = document.getElementById('testAudioBtn');
+    const musicDelaySelect = document.getElementById('musicDelay');
+    const deviceList = document.getElementById('deviceList');
+    const noDevices = document.getElementById('noDevices');
+    const remoteAudio = document.getElementById('remoteAudio');
+
+    let musicPauseTimer;
+    let msgFromName = 'ID ' + Math.random().toString(36).slice(2); // Временное имя собеседника
+
+    // Инициализация клиента Supabase
+    const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    const myId = Math.random().toString(36).slice(2);
+
+    // Функция отправки сигнала через канал Supabase
+    function sendSignal(payload) {
+        channel.send({ type: 'broadcast', event: 'signal',
+                       payload: { ...payload, from: myId } });
+    }
+
+    async function createAndSendOffer() {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        sendSignal({ type: 'offer', sdp: pc.localDescription });
+    }
+
+    async function handleSignal(msg) {
+        if (msg.from === myId) return; // Игнорируем свои сообщения
+
+        switch (msg.type) {
+            case 'hello':
+                // Услышал приветствие — создаём оффер, если соединения ещё нет
+                if (!pc.currentRemoteDescription) {
+                    await createAndSendOffer();
+                }
+                break;
+
+            case 'offer':
+                await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                sendSignal({ type: 'answer', sdp: pc.localDescription });
+                break;
+
+            case 'answer':
+                await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+                break;
+
+            case 'candidate':
+                try {
+                    await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+                } catch (e) { console.log("ICE ошибка:", e); }
+                break;
+        }
+    }
+
+    // Подписываемся на канал комнаты
+    const channel = sb.channel(ROOM, { config: { broadcast: { self: false } } });
+
+    channel.on('broadcast', { event: 'signal' }, ({ payload }) => handleSignal(payload));
+
+    channel.subscribe(status => {
+        if (status === 'SUBSCRIBED') {
+            // Отправляем приветствие: «Я здесь!»
+            channel.send({ type: 'broadcast', event: 'signal',
+                           payload: { type: 'hello', from: myId } });
+            statusDiv.textContent = "Статус: В комнате " + ROOM + ". Ищем собеседников...";
+        } else if (status === 'UNSUBSCRIBED') {
+            statusDiv.textContent = "Статус: Отключён от комнаты.";
+        }
+    });
+
+    // --- Инициализация: доступ к микрофону и запуск потока ---
+    async function init() {
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true
+                }
+            });
+
+            // Добавляем треки в соединение — звук идёт ПОСТОЯННО (без PTT)
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+            statusDiv.textContent = "Статус: Микрофон активен. Звук передаётся постоянно.";
+            statusDiv.className = "status-connected";
+
+            setupPeerConnectionEvents();
+        } catch (err) {
+            console.error("Ошибка доступа к микрофону", err);
+            statusDiv.textContent = "Ошибка: Нет доступа к микрофону! Проверьте настройки браузера.";
+            statusDiv.className = "status-disconnected";
+            alert("Нужен доступ к микрофону. Обновите страницу и разрешите использование микрофона.");
+        }
+    }
+
+    // --- Обработка событий соединения (WebRTC) ---
+    function setupPeerConnectionEvents() {
+        pc.ontrack = event => {
+            if (event.track.kind !== 'audio') return;
+            remoteAudio.srcObject = event.streams[0];
+            remoteAudio.play().catch(e =>
+                console.log("Автовоспроизведение заблокировано — нужен один тап по экрану для старта звука")
+            );
+            
+            // Показываем имя собеседника (пока это ID, но можно заменить на любое)
+            updateDeviceList("Собеседник: " + msgFromName);
+            
+            statusDiv.textContent = "Статус: Связь установлена. Говорите без нажатия кнопок.";
+            statusDiv.className = "status-connected";
+        };
+
+        pc.oniceconnectionstatechange = () => {
+            const state = pc.iceConnectionState;
+            if (state === 'disconnected' || state === 'failed') {
+                statusDiv.textContent = `Статус: Связь потеряна (${state}). Переподключение...`;
+                statusDiv.className = "status-disconnected";
+            } else if (state === 'connected') {
+                statusDiv.textContent = "Статус: Стабильное соединение.";
+                statusDiv.className = "status-connected";
+            }
+        };
+
+        pc.onicecandidate = event => {
+            if (event.candidate) {
+                sendSignal({ type: 'candidate', candidate: event.candidate });
+            }
+        };
+    }
+
+    // --- Логика паузы музыки (с задержкой) ---
+    function pauseMusicWithDelay() {
+        const delaySec = parseInt(musicDelaySelect.value);
+        const delayMs = delaySec * 1000;
+
+        clearTimeout(musicPauseTimer);
+
+        if (delayMs === 0) {
+            muteAudioInternal();
+            return;
+        }
+
+        musicPauseTimer = setTimeout(() => {
+            if (micEnabled) {
+                muteAudioInternal();
+            }
+        }, delayMs);
+    }
+
+    function resumeMusic() {
+        clearTimeout(musicPauseTimer);
+        unmuteAudioInternal();
+    }
+
+    function muteAudioInternal() {
+        console.log("Симуляция паузы музыки (задержка применена)");
+        statusDiv.textContent = "Музыка на паузе...";
+    }
+
+    function unmuteAudioInternal() {
+        console.log("Возобновление музыки");
+        statusDiv.textContent = "Статус: Ожидание...";
+    }
+
+    // --- Управление интерфейсом ---
+    micToggleBtn.addEventListener('click', () => {
+        micEnabled = !micEnabled;
+        localStream.getTracks().forEach(t => t.enabled = micEnabled);
+        
+        if (micEnabled) {
+            micToggleBtn.textContent = "Микрофон: ВКЛ";
+            micToggleBtn.className = "success";
+            resumeMusic();
+        } else {
+            micToggleBtn.textContent = "Микрофон: ВЫКЛ";
+            micToggleBtn.className = "danger";
+            pauseMusicWithDelay();
+        }
+    });
+
+    testAudioBtn.addEventListener('click', () => {
+        const testAudio = new Audio();
+        testAudio.srcObject = localStream;
+        testAudio.play();
+        setTimeout(() => testAudio.pause(), 3000);
+        alert("Вы слышите себя 3 секунды — это проверка микрофона.");
+    });
+
+    // --- Список устройств ---
+    function updateDeviceList(deviceName) {
+        if (noDevices) noDevices.style.display = 'none';
+        
+        const item = document.createElement('div');
+        item.className = 'device-item';
+        item.innerHTML = `
+            <span>${deviceName}</span>
+            <button onclick="this.parentElement.remove(); if(document.querySelectorAll('.device-item').length===0) document.getElementById('noDevices').style.display='block'"
+                    class="danger" style="padding: 4px 8px; font-size: 12px;">Удалить</button>
+        `;
+        deviceList.appendChild(item);
+    }
+
+    // Запуск при загрузке страницы
+    init();
+</script>
+
+<!-- PWA: регистрация service worker -->
+<script>
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('sw.js');
+    }
+</script>
+</body>
+</html>
