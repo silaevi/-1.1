@@ -3,14 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Интерком Wi‑Fi</title>
+    <title>Интерком Wi‑Fi (локальный)</title>
 
     <!-- PWA: манифест и тема -->
     <link rel="manifest" href="manifest.json">
     <meta name="theme-color" content="#007bff">
-
-    <!-- Библиотека Supabase для сигнализации -->
-    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
     <style>
         body { font-family: sans-serif; padding: 20px; background: #f0f2f5; color: #333; }
@@ -18,11 +15,14 @@
         button {
             padding: 12px 20px; font-size: 16px; cursor: pointer;
             background: #007bff; color: white; border: none; border-radius: 6px; margin-bottom: 8px;
+            width: 100%;
         }
         button:hover { background: #0056b3; }
         button.danger { background: #dc3545; }
         button.success { background: #28a745; }
-        select, input { padding: 8px; margin: 8px 0; width: 100%; box-sizing: border-box; }
+        button.gray { background: #6c757d; }
+        select, textarea { padding: 8px; margin: 8px 0; width: 100%; box-sizing: border-box; }
+        textarea { font-size: 12px; height: 90px; resize: vertical; }
         #status { margin-top: 10px; font-weight: bold; }
         #deviceList { margin-top: 20px; }
         .device-item {
@@ -30,23 +30,19 @@
             background: white; padding: 10px; margin-bottom: 5px; border-radius: 6px;
             border-left: 4px solid #007bff;
         }
+        .device-item button { width: auto; padding: 4px 10px; font-size: 12px; margin: 0; }
         .status-connected { color: #28a745; }
         .status-disconnected { color: #dc3545; }
+        .hint { font-size: 13px; color: #555; }
     </style>
 </head>
 <body>
 
 <div class="controls">
-    <h2>Интерком (Hands‑Free)</h2>
-    <p>Микрофон включается автоматически. Для разговора ничего нажимать не нужно.</p>
+    <h2>Интерком (локальная сеть)</h2>
+    <p class="hint">Микрофон включается автоматически. Разговор — без нажатия кнопок.
+       Все телефоны должны быть в одной Wi‑Fi сети.</p>
 
-    <label>Режим соединения:</label>
-    <select id="connectionMode">
-        <option value="local">Только локальная сеть (Wi‑Fi LAN)</option>
-        <option value="global">Через интернет (STUN/TURN)</option>
-    </select>
-
-    <br><br>
     <label>Задержка паузы фоновой музыки (сек):</label>
     <select id="musicDelay">
         <option value="0">0 сек (мгновенно)</option>
@@ -56,7 +52,22 @@
         <option value="4">4 сек</option>
     </select>
 
-    <br><br>
+    <hr>
+    <b>Подключение нового телефона:</b>
+
+    <!-- Шаг 1: создать код-приглашение -->
+    <button id="btnCreateOffer" class="success">1. Создать код подключения</button>
+
+    <!-- Шаг 2: принять код собеседника и ответить -->
+    <button id="btnAcceptOffer" class="gray">2. Вставить код собеседника и ответить</button>
+
+    <!-- Шаг 3: завершить у того, кто создал -->
+    <button id="btnAcceptAnswer" class="gray">3. Вставить ответ собеседника</button>
+
+    <textarea id="signalArea" placeholder="Здесь появится код подключения (или вставь сюда код собеседника)"></textarea>
+    <button id="btnCopy" class="gray">Скопировать код</button>
+
+    <hr>
     <button id="micToggleBtn" class="success">Микрофон: ВКЛ</button>
     <button id="testAudioBtn">Проверка связи (эхо 3 сек)</button>
 
@@ -72,18 +83,13 @@
 <audio id="remoteAudio" autoplay></audio>
 
 <script>
-    // ================= НАСТРОЙКИ SUPABASE (ОБЯЗАТЕЛЬНО ИЗМЕНИТЬ) =================
-    const SUPABASE_URL = 'https://ВСТАВЬ-СЮДА-URL-ПРОЕКТА.supabase.co';   // ← ЗАМЕНИ НА СВОЁ
-    const SUPABASE_KEY = 'ВСТАВЬ-СЮДА-ANON-KEY';                          // ← ЗАМЕНИ НА СВОЁ
-    const ROOM = 'intercom-main';  // Имя комнаты — одинаковое на всех устройствах
-    // ============================================================================
-
-    // --- Конфигурация и переменные ---
-    const pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
-    let pc = new RTCPeerConnection(pcConfig);
+    // --- Переменные ---
+    // Локальная сеть: STUN не нужен, работаем напрямую через Wi‑Fi
+    let pc = new RTCPeerConnection({});
     let localStream;
     let micEnabled = true;
-    
+    let isInitiator = false;
+
     const statusDiv = document.getElementById('status');
     const micToggleBtn = document.getElementById('micToggleBtn');
     const testAudioBtn = document.getElementById('testAudioBtn');
@@ -91,73 +97,23 @@
     const deviceList = document.getElementById('deviceList');
     const noDevices = document.getElementById('noDevices');
     const remoteAudio = document.getElementById('remoteAudio');
+    const signalArea = document.getElementById('signalArea');
 
     let musicPauseTimer;
-    let msgFromName = 'ID ' + Math.random().toString(36).slice(2); // Временное имя собеседника
 
-    // Инициализация клиента Supabase
-    const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
-    const myId = Math.random().toString(36).slice(2);
-
-    // Функция отправки сигнала через канал Supabase
-    function sendSignal(payload) {
-        channel.send({ type: 'broadcast', event: 'signal',
-                       payload: { ...payload, from: myId } });
+    // --- Ожидание сбора ICE-кандидатов (нужно перед показом кода) ---
+    function waitIceComplete() {
+        return new Promise(resolve => {
+            if (pc.iceGatheringState === 'complete') { resolve(); return; }
+            pc.addEventListener('icegatheringstatechange', () => {
+                if (pc.iceGatheringState === 'complete') resolve();
+            });
+            // Подстраховка: не ждём дольше 5 секунд
+            setTimeout(resolve, 5000);
+        });
     }
 
-    async function createAndSendOffer() {
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        sendSignal({ type: 'offer', sdp: pc.localDescription });
-    }
-
-    async function handleSignal(msg) {
-        if (msg.from === myId) return; // Игнорируем свои сообщения
-
-        switch (msg.type) {
-            case 'hello':
-                // Услышал приветствие — создаём оффер, если соединения ещё нет
-                if (!pc.currentRemoteDescription) {
-                    await createAndSendOffer();
-                }
-                break;
-
-            case 'offer':
-                await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-                const answer = await pc.createAnswer();
-                await pc.setLocalDescription(answer);
-                sendSignal({ type: 'answer', sdp: pc.localDescription });
-                break;
-
-            case 'answer':
-                await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-                break;
-
-            case 'candidate':
-                try {
-                    await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-                } catch (e) { console.log("ICE ошибка:", e); }
-                break;
-        }
-    }
-
-    // Подписываемся на канал комнаты
-    const channel = sb.channel(ROOM, { config: { broadcast: { self: false } } });
-
-    channel.on('broadcast', { event: 'signal' }, ({ payload }) => handleSignal(payload));
-
-    channel.subscribe(status => {
-        if (status === 'SUBSCRIBED') {
-            // Отправляем приветствие: «Я здесь!»
-            channel.send({ type: 'broadcast', event: 'signal',
-                           payload: { type: 'hello', from: myId } });
-            statusDiv.textContent = "Статус: В комнате " + ROOM + ". Ищем собеседников...";
-        } else if (status === 'UNSUBSCRIBED') {
-            statusDiv.textContent = "Статус: Отключён от комнаты.";
-        }
-    });
-
-    // --- Инициализация: доступ к микрофону и запуск потока ---
+    // --- Инициализация микрофона ---
     async function init() {
         try {
             localStream = await navigator.mediaDevices.getUserMedia({
@@ -168,54 +124,93 @@
                 }
             });
 
-            // Добавляем треки в соединение — звук идёт ПОСТОЯННО (без PTT)
             localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
-            statusDiv.textContent = "Статус: Микрофон активен. Звук передаётся постоянно.";
+            statusDiv.textContent = "Статус: Микрофон активен. Ожидание подключения...";
             statusDiv.className = "status-connected";
-
-            setupPeerConnectionEvents();
         } catch (err) {
-            console.error("Ошибка доступа к микрофону", err);
-            statusDiv.textContent = "Ошибка: Нет доступа к микрофону! Проверьте настройки браузера.";
+            statusDiv.textContent = "Ошибка: Нет доступа к микрофону!";
             statusDiv.className = "status-disconnected";
-            alert("Нужен доступ к микрофону. Обновите страницу и разрешите использование микрофона.");
+            alert("Нужен доступ к микрофону. Обнови страницу и разреши микрофон.");
         }
     }
 
-    // --- Обработка событий соединения (WebRTC) ---
+    // --- События соединения ---
     function setupPeerConnectionEvents() {
         pc.ontrack = event => {
             if (event.track.kind !== 'audio') return;
             remoteAudio.srcObject = event.streams[0];
             remoteAudio.play().catch(e =>
-                console.log("Автовоспроизведение заблокировано — нужен один тап по экрану для старта звука")
+                console.log("Автовоспроизведение заблокировано — сделай один тап по экрану")
             );
-            
-            // Показываем имя собеседника (пока это ID, но можно заменить на любое)
-            updateDeviceList("Собеседник: " + msgFromName);
-            
-            statusDiv.textContent = "Статус: Связь установлена. Говорите без нажатия кнопок.";
+            updateDeviceList("Собеседник подключён");
+            statusDiv.textContent = "Статус: Связь установлена. Говорите без кнопок.";
             statusDiv.className = "status-connected";
         };
 
         pc.oniceconnectionstatechange = () => {
             const state = pc.iceConnectionState;
             if (state === 'disconnected' || state === 'failed') {
-                statusDiv.textContent = `Статус: Связь потеряна (${state}). Переподключение...`;
+                statusDiv.textContent = "Статус: Связь потеряна. Проверьте Wi‑Fi.";
                 statusDiv.className = "status-disconnected";
             } else if (state === 'connected') {
                 statusDiv.textContent = "Статус: Стабильное соединение.";
                 statusDiv.className = "status-connected";
             }
         };
-
-        pc.onicecandidate = event => {
-            if (event.candidate) {
-                sendSignal({ type: 'candidate', candidate: event.candidate });
-            }
-        };
     }
+
+    // --- Шаг 1: создать код-приглашение ---
+    document.getElementById('btnCreateOffer').addEventListener('click', async () => {
+        if (!localStream) { alert("Сначала дай доступ к микрофону"); return; }
+        isInitiator = true;
+        setupPeerConnectionEvents();
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await waitIceComplete();
+
+        signalArea.value = btoa(JSON.stringify(pc.localDescription));
+        statusDiv.textContent = "Статус: Код готов. Отправь его собеседнику (шаг 2 у него).";
+    });
+
+    // --- Шаг 2: принять код-приглашение и создать ответ ---
+    document.getElementById('btnAcceptOffer').addEventListener('click', async () => {
+        if (!localStream) { alert("Сначала дай доступ к микрофону"); return; }
+        try {
+            setupPeerConnectionEvents();
+
+            const offer = JSON.parse(atob(signalArea.value.trim()));
+            await pc.setRemoteDescription(new RTCSessionDescription(offer));
+
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            await waitIceComplete();
+
+            signalArea.value = btoa(JSON.stringify(pc.localDescription));
+            statusDiv.textContent = "Статус: Ответ готов. Отправь его обратно (шаг 3 у собеседника).";
+        } catch (e) {
+            alert("Не удалось прочитать код. Убедись, что вставлен код из шага 1.");
+        }
+    });
+
+    // --- Шаг 3: у создателя — вставить ответ ---
+    document.getElementById('btnAcceptAnswer').addEventListener('click', async () => {
+        try {
+            const answer = JSON.parse(atob(signalArea.value.trim()));
+            await pc.setRemoteDescription(new RTCSessionDescription(answer));
+            statusDiv.textContent = "Статус: Соединяемся...";
+        } catch (e) {
+            alert("Не удалось прочитать код. Нужен код из шага 2 (ответ).");
+        }
+    });
+
+    // --- Копирование кода ---
+    document.getElementById('btnCopy').addEventListener('click', () => {
+        signalArea.select();
+        document.execCommand('copy');
+        alert("Код скопирован. Отправь его собеседнику любым способом.");
+    });
 
     // --- Логика паузы музыки (с задержкой) ---
     function pauseMusicWithDelay() {
@@ -224,15 +219,10 @@
 
         clearTimeout(musicPauseTimer);
 
-        if (delayMs === 0) {
-            muteAudioInternal();
-            return;
-        }
+        if (delayMs === 0) { muteAudioInternal(); return; }
 
         musicPauseTimer = setTimeout(() => {
-            if (micEnabled) {
-                muteAudioInternal();
-            }
+            if (micEnabled) muteAudioInternal();
         }, delayMs);
     }
 
@@ -255,7 +245,7 @@
     micToggleBtn.addEventListener('click', () => {
         micEnabled = !micEnabled;
         localStream.getTracks().forEach(t => t.enabled = micEnabled);
-        
+
         if (micEnabled) {
             micToggleBtn.textContent = "Микрофон: ВКЛ";
             micToggleBtn.className = "success";
@@ -272,19 +262,19 @@
         testAudio.srcObject = localStream;
         testAudio.play();
         setTimeout(() => testAudio.pause(), 3000);
-        alert("Вы слышите себя 3 секунды — это проверка микрофона.");
+        alert("Ты слышишь себя 3 секунды — это проверка микрофона.");
     });
 
     // --- Список устройств ---
     function updateDeviceList(deviceName) {
         if (noDevices) noDevices.style.display = 'none';
-        
+
         const item = document.createElement('div');
         item.className = 'device-item';
         item.innerHTML = `
             <span>${deviceName}</span>
             <button onclick="this.parentElement.remove(); if(document.querySelectorAll('.device-item').length===0) document.getElementById('noDevices').style.display='block'"
-                    class="danger" style="padding: 4px 8px; font-size: 12px;">Удалить</button>
+                    class="danger">Удалить</button>
         `;
         deviceList.appendChild(item);
     }
